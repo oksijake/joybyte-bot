@@ -3,6 +3,7 @@ import os
 import re
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from aiohttp import web
 
 # --- НАСТРОЙКИ ---
 API_ID = 38360905
@@ -187,6 +188,21 @@ async def handle_new_post(event):
     except Exception as e:
         print(f"[ОШИБКА] Не удалось опубликовать: {e}")
 
+# --- Веб-сервер для Render, чтобы он не ругался на отсутствие открытых портов ---
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Веб-сервер для Render запущен на порту {port}")
+
 async def main():
     print("Инициализация подключения к Telegram...")
     await client.connect()
@@ -194,6 +210,9 @@ async def main():
     if not await client.is_user_authorized():
         print("Ошибка: сессия не авторизована.")
         return
+        
+    # Запускаем фоновый веб-сервер
+    await start_web_server()
         
     print("Бот запущен и отслеживает посты (с сохранением цитат и разметки)...")
     
