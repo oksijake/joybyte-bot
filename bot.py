@@ -1,10 +1,15 @@
 import asyncio
+import os
 import re
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
 # --- НАСТРОЙКИ ---
 API_ID = 38360905
 API_HASH = '99073f3ecb25cbf13adf9391ae4190c3'
+
+# Берем строку сессии из переменных окружения Render
+SESSION_STRING = os.getenv('SESSION_STRING')
 
 SOURCE_CHANNELS = [
     'pekagame',
@@ -87,7 +92,8 @@ def clean_text_and_entities(text, entities):
 
     return text, safe_entities if safe_entities else None
 
-client = TelegramClient('my_game_session', API_ID, API_HASH)
+# Инициализируем клиент через StringSession для облачного хостинга на Render
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 albums_cache = {}
 
