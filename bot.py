@@ -18,7 +18,6 @@ SOURCE_CHANNELS = [
     'pekagame',
     'SteamNetwork',
     'igromania',
-    'Dota2',
     'oksikek',
     -1001807003554,
 ]
@@ -33,7 +32,7 @@ SPAM_PATTERNS = [
 ]
 
 # Хранилище для защиты от дубликатов из разных каналов
-# Сохраняет список словарей: [{'normalized_text': '...', 'timestamp': 1234567890}]
+# Сохраняет список словарей: [{'normalized_text': '...', 'keywords': set(), 'timestamp': 1234567890}]
 SENT_POSTS_HISTORY = []
 DUPLICATE_TIME_WINDOW = 3 * 60 * 60  # Время хранения истории дублей (3 часа)
 SIMILARITY_THRESHOLD = 0.70          # Порог похожести (70%), при котором пост считается дублем
@@ -59,8 +58,31 @@ def normalize_text(text):
     return " ".join(filtered_words)
 
 
+def extract_keywords(text):
+    """Извлекает значимые ключевые слова (имена, бренды, термины) для поиска дублей по смыслу."""
+    if not text:
+        return set()
+    
+    text = text.lower()
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    text = re.sub(r'@\w+', '', text)
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    words = text.split()
+    stop_words = {
+        'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 
+        'все', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 
+        'ее', 'мне', 'было', 'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему', 
+        'теперь', 'когда', 'даже', 'ру', 'the', 'a', 'an', 'in', 'to', 'is', 'of', 'for',
+        'сообщает', 'данным', 'уже', 'еще', 'года', 'около', 'после'
+    }
+    
+    filtered = {w for w in words if w not in stop_words and len(w) > 3}
+    return filtered
+
+
 def is_duplicate_post(raw_text):
-    """Проверяет, публиковался ли похожий текст за последние часы."""
+    """Проверяет, публиковался ли похожий текст или новость на ту же тему за последние часы."""
     global SENT_POSTS_HISTORY
     current_time = time.time()
     
@@ -68,13 +90,23 @@ def is_duplicate_post(raw_text):
     SENT_POSTS_HISTORY = [item for item in SENT_POSTS_HISTORY if current_time - item['timestamp'] < DUPLICATE_TIME_WINDOW]
     
     norm_new = normalize_text(raw_text)
+    keywords_new = extract_keywords(raw_text)
+    
     if not norm_new or len(norm_new.split()) < 4:
-        return False  # Слишком короткий текст для надежного сравнения через антидубликат
+        return False  # Слишком короткий текст для надежного сравнения
 
     for item in SENT_POSTS_HISTORY:
         norm_existing = item['normalized_text']
+        keywords_existing = item.get('keywords', set())
         
-        # Считаем коэффициент схожести текстов (SequenceMatcher)
+        # 1. Проверка по совпадению ключевых слов (новостной теме)
+        if keywords_new and keywords_existing:
+            common_keywords = keywords_new.intersection(keywords_existing)
+            if len(common_keywords) >= 3:
+                print(f"[АНТИДУБЛЬ] Найдена та же новость по ключевым словам ({common_keywords}). Пропускаем.")
+                return True
+
+        # 2. Считаем коэффициент схожести текстов (SequenceMatcher)
         similarity = difflib.SequenceMatcher(None, norm_new, norm_existing).ratio()
         
         if similarity >= SIMILARITY_THRESHOLD:
@@ -84,6 +116,7 @@ def is_duplicate_post(raw_text):
     # Если дубликат не найден, добавляем текущий в историю
     SENT_POSTS_HISTORY.append({
         'normalized_text': norm_new,
+        'keywords': keywords_new,
         'timestamp': current_time
     })
     return False
@@ -187,7 +220,7 @@ async def handle_new_post(event):
             raw_txt = data['text']
             ent = data['entities']
             
-            # Проверяем альбом на дубликаты по тексту
+            # Проверяем альбом на дубликаты по тексту и ключевым словам
             if raw_txt and is_duplicate_post(raw_txt):
                 return
             
@@ -272,7 +305,7 @@ async def main():
         
     await start_web_server()
         
-    print("Бот запущен и отслеживает посты (с защитой от дубликатов)...")
+    print("Бот запущен и отслеживает посты (с улучшенной защитой от дубликатов)...")
         
     while True:
         try:
