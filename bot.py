@@ -1,6 +1,8 @@
 import asyncio
 import os
 import re
+import time
+import difflib
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from aiohttp import web
@@ -30,6 +32,63 @@ SPAM_PATTERNS = [
     r'реклама', r'erid:', r'подписывайтесь на канал', r'наш партнер', r'коллеги рекомендуют'
 ]
 
+# Хранилище для защиты от дубликатов из разных каналов
+# Сохраняет список словарей: [{'normalized_text': '...', 'timestamp': 1234567890}]
+SENT_POSTS_HISTORY = []
+DUPLICATE_TIME_WINDOW = 3 * 60 * 60  # Время хранения истории дублей (3 часа)
+SIMILARITY_THRESHOLD = 0.70          # Порог похожести (70%), при котором пост считается дублем
+
+
+def normalize_text(text):
+    """Приводит текст к нормализованному виду для сравнения (удаляет знаки, ссылки, стоп-слова)."""
+    if not text:
+        return ""
+    
+    text = text.lower()
+    # Удаляем ссылки, упоминания, теги
+    text = re.sub(r'https?://\S+|www\.\S+', '', text)
+    text = re.sub(r'@\w+', '', text)
+    # Оставляем только буквы и цифры
+    text = re.sub(r'[^\w\s]', '', text)
+    
+    # Удаляем короткие стоп-слова
+    words = text.split()
+    stop_words = {'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 'все', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне', 'было', 'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ру', 'the', 'a', 'an', 'in', 'to', 'is', 'of', 'for'}
+    filtered_words = [w for w in words if w not in stop_words and len(w) > 2]
+    
+    return " ".join(filtered_words)
+
+
+def is_duplicate_post(raw_text):
+    """Проверяет, публиковался ли похожий текст за последние часы."""
+    global SENT_POSTS_HISTORY
+    current_time = time.time()
+    
+    # Очищаем устаревшую историю
+    SENT_POSTS_HISTORY = [item for item in SENT_POSTS_HISTORY if current_time - item['timestamp'] < DUPLICATE_TIME_WINDOW]
+    
+    norm_new = normalize_text(raw_text)
+    if not norm_new or len(norm_new.split()) < 4:
+        return False  # Слишком короткий текст для надежного сравнения через антидубликат
+
+    for item in SENT_POSTS_HISTORY:
+        norm_existing = item['normalized_text']
+        
+        # Считаем коэффициент схожести текстов (SequenceMatcher)
+        similarity = difflib.SequenceMatcher(None, norm_new, norm_existing).ratio()
+        
+        if similarity >= SIMILARITY_THRESHOLD:
+            print(f"[АНТИДУБЛЬ] Найден похожий пост (схожесть {int(similarity * 100)}%). Пропускаем.")
+            return True
+            
+    # Если дубликат не найден, добавляем текущий в историю
+    SENT_POSTS_HISTORY.append({
+        'normalized_text': norm_new,
+        'timestamp': current_time
+    })
+    return False
+
+
 def is_ad_or_pr(text):
     if not text:
         return False
@@ -38,6 +97,7 @@ def is_ad_or_pr(text):
         if re.search(pattern, text_lower):
             return True
     return False
+
 
 def clean_text_and_entities(text, entities):
     if not text:
@@ -48,11 +108,9 @@ def clean_text_and_entities(text, entities):
     safe_entities = []
     if entities:
         for e in entities:
-            # Игнорируем только кастомные эмодзи из разметки
             if isinstance(e, types.MessageEntityCustomEmoji):
                 continue
 
-            # Фильтруем Telegram-ссылки внутри текста
             if isinstance(e, (types.MessageEntityTextUrl, types.MessageEntityUrl)):
                 url = getattr(e, 'url', '')
                 if 't.me' in url or 'telegram.me' in url or 'tg://' in url:
@@ -68,15 +126,11 @@ def clean_text_and_entities(text, entities):
 
             safe_entities.append(e)
 
-    # Очистка только явных мусорных артефактов, не трогая цитаты и списки
     text = text.replace('🥺', '')
-
-    # Удаляем прямые упоминания через @ и чистые t.me ссылки из текста
     text = re.sub(r'https?://t\.me/\w+/?', '', text)
     text = re.sub(r't\.me/\w+/?', '', text)
     text = re.sub(r'@\w+', '', text)
 
-    # Подчищаем мусорные висячие фразы в конце
     orphan_phrases = [
         r'скачать можно\s*[\.,!]?(?=\s*$)',
         r'взять можно\s*[\.,!]?(?=\s*$)',
@@ -90,12 +144,11 @@ def clean_text_and_entities(text, entities):
         text = re.sub(pattern, '', text, flags=re.IGNORECASE)
 
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
-
     return text, safe_entities if safe_entities else None
+
 
 # Инициализируем клиент через StringSession для облачного хостинга на Render
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-
 albums_cache = {}
 
 @client.on(events.NewMessage(chats=SOURCE_CHANNELS))
@@ -109,7 +162,7 @@ async def handle_new_post(event):
 
     safe_entities = list(message.entities) if message.entities else None
 
-    # Обработка альбомов
+    # Обработка альбомов (медиа-групп)
     if message.grouped_id:
         group_id = message.grouped_id
         if group_id not in albums_cache:
@@ -134,8 +187,11 @@ async def handle_new_post(event):
             raw_txt = data['text']
             ent = data['entities']
             
-            print(f"[АЛЬБОМ] Публикуем альбом из {data['chat']}...")
+            # Проверяем альбом на дубликаты по тексту
+            if raw_txt and is_duplicate_post(raw_txt):
+                return
             
+            print(f"[АЛЬБОМ] Публикуем альбом из {data['chat']}...")
             cleaned_text, final_entities = clean_text_and_entities(raw_txt, ent)
             media_list = [m.media for m in msgs if m.media]
             
@@ -163,6 +219,9 @@ async def handle_new_post(event):
         return
 
     # Одиночные посты
+    if text and is_duplicate_post(text):
+        return
+
     print(f"[НОВЫЙ ПОСТ] Обрабатываем пост из {event.chat_id}...")
     cleaned_text, final_entities = clean_text_and_entities(text, safe_entities)
 
@@ -188,7 +247,7 @@ async def handle_new_post(event):
     except Exception as e:
         print(f"[ОШИБКА] Не удалось опубликовать: {e}")
 
-# --- Веб-сервер для Render, чтобы он не ругался на отсутствие открытых портов ---
+# --- Веб-сервер для Render ---
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
 
@@ -211,11 +270,10 @@ async def main():
         print("Ошибка: сессия не авторизована.")
         return
         
-    # Запускаем фоновый веб-сервер
     await start_web_server()
         
-    print("Бот запущен и отслеживает посты (с сохранением цитат и разметки)...")
-    
+    print("Бот запущен и отслеживает посты (с защитой от дубликатов)...")
+        
     while True:
         try:
             await client.run_until_disconnected()
