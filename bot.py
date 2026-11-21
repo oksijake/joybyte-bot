@@ -154,6 +154,48 @@ def _shift_py_index(idx: int, removed_spans: list) -> int:
     return max(0, shifted)
 
 
+def _clone_entity(e, new_offset: int, new_length: int):
+    try:
+        if isinstance(e, types.MessageEntityTextUrl):
+            return types.MessageEntityTextUrl(
+                offset=new_offset,
+                length=new_length,
+                url=getattr(e, 'url', '') or ''
+            )
+        if isinstance(e, types.MessageEntityMentionName):
+            return types.MessageEntityMentionName(
+                offset=new_offset,
+                length=new_length,
+                user_id=getattr(e, 'user_id', 0)
+            )
+        if isinstance(e, types.MessageEntityPre):
+            return types.MessageEntityPre(
+                offset=new_offset,
+                length=new_length,
+                language=getattr(e, 'language', '') or ''
+            )
+        if isinstance(e, types.MessageEntitySpoiler):
+            return types.MessageEntitySpoiler(
+                offset=new_offset,
+                length=new_length
+            )
+        if isinstance(e, types.MessageEntityBlockquote):
+            return types.MessageEntityBlockquote(
+                offset=new_offset,
+                length=new_length,
+                collapsed=getattr(e, 'collapsed', None)
+            )
+
+        e_copy = type(e)(offset=new_offset, length=new_length)
+        for attr in ('url', 'user_id', 'language', 'document_id', 'collapsed'):
+            if hasattr(e, attr) and hasattr(e_copy, attr):
+                setattr(e_copy, attr, getattr(e, attr))
+        return e_copy
+    except Exception as err:
+        print(f"[РАЗМЕТКА] Пропущена сущность {type(e).__name__}: {err}")
+        return None
+
+
 def clean_text_and_entities(text: str, entities):
     if not text:
         return "", None
@@ -208,11 +250,9 @@ def clean_text_and_entities(text: str, entities):
             if new_length <= 0:
                 continue
 
-            e_copy = type(e)(offset=new_offset, length=new_length)
-            for attr in ('url', 'user_id', 'language', 'document_id', 'collapsed'):
-                if hasattr(e, attr) and hasattr(e_copy, attr):
-                    setattr(e_copy, attr, getattr(e, attr))
-            safe_entities.append(e_copy)
+            e_copy = _clone_entity(e, new_offset, new_length)
+            if e_copy is not None:
+                safe_entities.append(e_copy)
 
     text = text.replace('🥺', '')
     text = re.sub(r'https?://(?:t|telegram)\.me/\S+', '', text, flags=re.IGNORECASE)
@@ -315,6 +355,8 @@ async def _finalize_album(group_id: int):
             if cleaned_text:
                 record_published_post(cleaned_text)
             print("[УСПЕХ] Альбом опубликован!")
+    except Exception as e:
+        print(f"[ОШИБКА] Сбой при обработке альбома {group_id}: {e}")
     finally:
         album_tasks.pop(group_id, None)
 
@@ -334,52 +376,55 @@ def _is_tracked_chat(event) -> bool:
 
 @client.on(events.NewMessage())
 async def handle_new_post(event):
-    if not _is_tracked_chat(event):
-        return
+    try:
+        if not _is_tracked_chat(event):
+            return
 
-    message = event.message
-    text = message.raw_text or ""
-    safe_entities = list(message.entities) if message.entities else None
+        message = event.message
+        text = message.raw_text or ""
+        safe_entities = list(message.entities) if message.entities else None
 
-    if message.grouped_id:
-        group_id = message.grouped_id
-        if group_id not in albums_cache:
-            albums_cache[group_id] = {
-                'messages': [],
-                'text': "",
-                'entities': None,
-                'chat': event.chat_id
-            }
+        if message.grouped_id:
+            group_id = message.grouped_id
+            if group_id not in albums_cache:
+                albums_cache[group_id] = {
+                    'messages': [],
+                    'text': "",
+                    'entities': None,
+                    'chat': event.chat_id
+                }
 
-        albums_cache[group_id]['messages'].append(message)
+            albums_cache[group_id]['messages'].append(message)
 
-        if text and not albums_cache[group_id]['text']:
-            albums_cache[group_id]['text'] = text
-            albums_cache[group_id]['entities'] = safe_entities
+            if text and not albums_cache[group_id]['text']:
+                albums_cache[group_id]['text'] = text
+                albums_cache[group_id]['entities'] = safe_entities
 
-        if group_id not in album_tasks:
-            album_tasks[group_id] = asyncio.create_task(_finalize_album(group_id))
-        return
+            if group_id not in album_tasks:
+                album_tasks[group_id] = asyncio.create_task(_finalize_album(group_id))
+            return
 
-    if is_ad_or_pr(text):
-        print(f"[ПРОПУСК] Реклама/спам/фильтр в канале {event.chat_id}")
-        return
+        if is_ad_or_pr(text):
+            print(f"[ПРОПУСК] Реклама/спам/фильтр в канале {event.chat_id}")
+            return
 
-    cleaned_text, final_entities = clean_text_and_entities(text, safe_entities)
-    if cleaned_text and is_duplicate_post(cleaned_text):
-        return
+        cleaned_text, final_entities = clean_text_and_entities(text, safe_entities)
+        if cleaned_text and is_duplicate_post(cleaned_text):
+            return
 
-    media_list = [message.media] if message.media else []
-    if not cleaned_text and not media_list:
-        print("[ПРОПУСК] Сообщение пустое.")
-        return
+        media_list = [message.media] if message.media else []
+        if not cleaned_text and not media_list:
+            print("[ПРОПУСК] Сообщение пустое.")
+            return
 
-    print(f"[НОВЫЙ ПОСТ] Обрабатываем пост из {event.chat_id}...")
-    ok = await publish_content(media_list, cleaned_text, final_entities, is_album=False)
-    if ok:
-        if cleaned_text:
-            record_published_post(cleaned_text)
-        print("[УСПЕХ] Пост опубликован в @joybyte!")
+        print(f"[НОВЫЙ ПОСТ] Обрабатываем пост из {event.chat_id}...")
+        ok = await publish_content(media_list, cleaned_text, final_entities, is_album=False)
+        if ok:
+            if cleaned_text:
+                record_published_post(cleaned_text)
+            print("[УСПЕХ] Пост опубликован в @joybyte!")
+    except Exception as e:
+        print(f"[ОШИБКА] Сбой при обработке сообщения: {e}")
 
 
 async def handle_ping(request):
