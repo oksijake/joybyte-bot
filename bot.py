@@ -57,6 +57,9 @@ SENT_POSTS_HISTORY = []
 DUPLICATE_TIME_WINDOW = 3 * 60 * 60  # 3 часа
 SIMILARITY_THRESHOLD = 0.78          # Порог схожести текста (78%)
 
+ACTIVE_SOURCES = list(SOURCE_CHANNELS)
+ALBUM_DELAY = 1.5
+
 
 def _utf16_len(s: str) -> int:
     return len(s.encode('utf-16-le')) // 2
@@ -279,17 +282,63 @@ async def publish_content(media_list, cleaned_text: str, final_entities, is_albu
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 albums_cache = {}
+album_tasks = {}
 
 
-@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
+async def _finalize_album(group_id: int):
+    try:
+        await asyncio.sleep(ALBUM_DELAY)
+        data = albums_cache.pop(group_id, None)
+        if not data:
+            return
+
+        msgs = data['messages']
+        raw_txt = data['text']
+        ent = data['entities']
+
+        if is_ad_or_pr(raw_txt):
+            print(f"[ПРОПУСК] Реклама/спам/фильтр в альбоме из канала {data['chat']}")
+            return
+
+        cleaned_text, final_entities = clean_text_and_entities(raw_txt, ent)
+        if cleaned_text and is_duplicate_post(cleaned_text):
+            return
+
+        media_list = [m.media for m in msgs if m.media]
+        if not cleaned_text and not media_list:
+            print("[ПРОПУСК] Альбом пуст после очистки.")
+            return
+
+        print(f"[АЛЬБОМ] Публикуем альбом из {data['chat']}...")
+        ok = await publish_content(media_list, cleaned_text, final_entities, is_album=True)
+        if ok:
+            if cleaned_text:
+                record_published_post(cleaned_text)
+            print("[УСПЕХ] Альбом опубликован!")
+    finally:
+        album_tasks.pop(group_id, None)
+
+
+def _is_tracked_chat(event) -> bool:
+    chat_id = event.chat_id
+    sender_username = (getattr(event.chat, 'username', None) or '').lower()
+    for src in ACTIVE_SOURCES:
+        if isinstance(src, int) and src == chat_id:
+            return True
+        if isinstance(src, str):
+            clean_src = src.lstrip('@').lower()
+            if sender_username and sender_username == clean_src:
+                return True
+    return False
+
+
+@client.on(events.NewMessage())
 async def handle_new_post(event):
-    message = event.message
-    text = message.raw_text or ""
-
-    if is_ad_or_pr(text):
-        print(f"[ПРОПУСК] Реклама/спам/фильтр в канале {event.chat_id}")
+    if not _is_tracked_chat(event):
         return
 
+    message = event.message
+    text = message.raw_text or ""
     safe_entities = list(message.entities) if message.entities else None
 
     if message.grouped_id:
@@ -308,29 +357,12 @@ async def handle_new_post(event):
             albums_cache[group_id]['text'] = text
             albums_cache[group_id]['entities'] = safe_entities
 
-        await asyncio.sleep(1.5)
+        if group_id not in album_tasks:
+            album_tasks[group_id] = asyncio.create_task(_finalize_album(group_id))
+        return
 
-        if group_id in albums_cache:
-            data = albums_cache.pop(group_id)
-            msgs = data['messages']
-            raw_txt = data['text']
-            ent = data['entities']
-
-            cleaned_text, final_entities = clean_text_and_entities(raw_txt, ent)
-            if cleaned_text and is_duplicate_post(cleaned_text):
-                return
-
-            media_list = [m.media for m in msgs if m.media]
-            if not cleaned_text and not media_list:
-                print("[ПРОПУСК] Альбом пуст после очистки.")
-                return
-
-            print(f"[АЛЬБОМ] Публикуем альбом из {data['chat']}...")
-            ok = await publish_content(media_list, cleaned_text, final_entities, is_album=True)
-            if ok:
-                if cleaned_text:
-                    record_published_post(cleaned_text)
-                print("[УСПЕХ] Альбом опубликован!")
+    if is_ad_or_pr(text):
+        print(f"[ПРОПУСК] Реклама/спам/фильтр в канале {event.chat_id}")
         return
 
     cleaned_text, final_entities = clean_text_and_entities(text, safe_entities)
@@ -367,9 +399,11 @@ async def start_web_server():
 
 
 async def preload_channels():
-    """Выводит каналы из диалогов аккаунта (с их ID) и проверяет источники."""
+    """Выводит каналы из диалогов аккаунта (с их ID), автонаходит каналы по названию и проверяет источники."""
+    global ACTIVE_SOURCES
     dialogs = await client.get_dialogs()
     print("--- КАНАЛЫ В ДИАЛОГАХ АККАУНТА (ID | НАЗВАНИЕ | @USERNAME) ---")
+    channel_dialogs = []
     for d in dialogs:
         if d.is_channel:
             peer_id = get_peer_id(d.entity)
@@ -377,18 +411,45 @@ async def preload_channels():
             username = getattr(d.entity, 'username', None)
             u_str = f"@{username}" if username else "приватный"
             print(f"  ID: {peer_id} | {title} | {u_str}")
+            channel_dialogs.append((peer_id, title, username))
     print("-------------------------------------------------------------")
 
-    for ch in SOURCE_CHANNELS:
+    found_sources = list(SOURCE_CHANNELS)
+    for target_title in AUTO_FIND_BY_TITLE:
+        t_lower = target_title.strip().lower()
+        matched = False
+        for peer_id, title, _ in channel_dialogs:
+            if t_lower and t_lower in (title or '').lower():
+                if peer_id not in found_sources:
+                    found_sources.append(peer_id)
+                print(f"[АВТОПОИСК] Найден канал '{title}' -> ID {peer_id}")
+                matched = True
+                break
+        if not matched:
+            print(f"[АВТОПОИСК] Канал с названием '{target_title}' не найден среди диалогов аккаунта.")
+
+    ACTIVE_SOURCES = found_sources
+
+    for ch in ACTIVE_SOURCES:
         try:
             entity = await client.get_entity(ch)
             print(f"[КАНАЛ ОК] {ch} -> {getattr(entity, 'title', ch)}")
         except Exception as e:
             print(f"[КАНАЛ ОШИБКА] Нет доступа к {ch}: {e}")
 
+    try:
+        target_entity = await client.get_entity(TARGET_CHANNEL)
+        print(f"[ЦЕЛЬ ОК] {TARGET_CHANNEL} -> {getattr(target_entity, 'title', TARGET_CHANNEL)}")
+    except Exception as e:
+        print(f"[ЦЕЛЬ ОШИБКА] Нет доступа к целевому каналу {TARGET_CHANNEL}: {e}")
+
 
 async def main():
     print("Инициализация подключения к Telegram...")
+    if not SESSION_STRING:
+        print("[ОШИБКА] Переменная окружения SESSION_STRING не задана!")
+        return
+
     await client.connect()
 
     if not await client.is_user_authorized():
