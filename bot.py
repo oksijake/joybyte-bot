@@ -1,11 +1,14 @@
 import asyncio
+import difflib
 import os
 import re
 import time
-import difflib
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 from aiohttp import web
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
+from telethon.tl import types
+from telethon.utils import get_peer_id
 
 # --- НАСТРОЙКИ ---
 API_ID = 38360905
@@ -14,8 +17,9 @@ API_HASH = '99073f3ecb25cbf13adf9391ae4190c3'
 # Берем строку сессии из переменных окружения Render
 SESSION_STRING = os.getenv('SESSION_STRING')
 
+# После запуска посмотрите в логах Render строку с нужным каналом и вставьте сюда его ID (например, -1001234567890)
 SOURCE_CHANNELS = [
-    '1418440636',
+    -1001418440636,
     'oneshot_tg',
     'igromania',
     'oksikek',
@@ -42,101 +46,88 @@ SPAM_PATTERNS = [
     # Сервисы пополнения и рекламные маркетплейсы ключей/игр
     r'ggsel', r'карт[аыу]\s+пополнен[ия]', r'сервис[а-яё]*\s+пополнен[ия]',
     r'пополн[иеить]{2,5}\s+(?:steam|стим|баланс|кошелек|кошелёк|аккаунт[а-яё]*)',
-    r'залетайте\s+на\s+\S+\s+за\s+(?:игр[оойу]|ключ[а-яё]*|карт[а-яё]*|пополнени[а-яё]*)'
+    r'залетайте\s+на\s+\S+\s+за\s+(?:игр[оойу]|ключ[а-яё]*|карт[аыу]|пополнени[а-яё]*)'
 ]
 
-# Хранилище для защиты от дубликатов из разных каналов
-# Сохраняет список словарей: [{'normalized_text': '...', 'keywords': set(), 'timestamp': 1234567890}]
 SENT_POSTS_HISTORY = []
-DUPLICATE_TIME_WINDOW = 3 * 60 * 60  # Время хранения истории дублей (3 часа)
-SIMILARITY_THRESHOLD = 0.70          # Порог похожести (70%), при котором пост считается дублем
+DUPLICATE_TIME_WINDOW = 3 * 60 * 60  # 3 часа
+SIMILARITY_THRESHOLD = 0.78          # Порог схожести текста (78%)
 
 
-def normalize_text(text):
-    """Приводит текст к нормализованному виду для сравнения (удаляет знаки, ссылки, стоп-слова)."""
+def _utf16_len(s: str) -> int:
+    return len(s.encode('utf-16-le')) // 2
+
+
+def _utf16_to_py_index(s: str, utf16_offset: int) -> int:
+    cur_utf16 = 0
+    for idx, ch in enumerate(s):
+        if cur_utf16 >= utf16_offset:
+            return idx
+        cur_utf16 += _utf16_len(ch)
+    return len(s)
+
+
+def _py_to_utf16_index(s: str, py_index: int) -> int:
+    return _utf16_len(s[:py_index])
+
+
+def normalize_text(text: str) -> str:
     if not text:
         return ""
-    
+
     text = text.lower()
-    # Удаляем ссылки, упоминания, теги
     text = re.sub(r'https?://\S+|www\.\S+', '', text)
     text = re.sub(r'@\w+', '', text)
-    # Оставляем только буквы и цифры
     text = re.sub(r'[^\w\s]', '', text)
-    
-    # Удаляем короткие стоп-слова
+
     words = text.split()
-    stop_words = {'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 'все', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне', 'было', 'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ру', 'the', 'a', 'an', 'in', 'to', 'is', 'of', 'for'}
+    stop_words = {
+        'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то',
+        'все', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только',
+        'ее', 'мне', 'было', 'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему',
+        'теперь', 'когда', 'даже', 'ру', 'the', 'a', 'an', 'in', 'to', 'is', 'of', 'for'
+    }
     filtered_words = [w for w in words if w not in stop_words and len(w) > 2]
-    
     return " ".join(filtered_words)
 
 
-def extract_keywords(text):
-    """Извлекает значимые ключевые слова (имена, бренды, термины) для поиска дублей по смыслу."""
-    if not text:
-        return set()
-    
-    text = text.lower()
-    text = re.sub(r'https?://\S+|www\.\S+', '', text)
-    text = re.sub(r'@\w+', '', text)
-    text = re.sub(r'[^\w\s]', '', text)
-    
-    words = text.split()
-    stop_words = {
-        'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 
-        'все', 'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 
-        'ее', 'мне', 'было', 'вот', 'от', 'меня', 'еще', 'нет', 'о', 'из', 'ему', 
-        'теперь', 'когда', 'даже', 'ру', 'the', 'a', 'an', 'in', 'to', 'is', 'of', 'for',
-        'сообщает', 'данным', 'уже', 'еще', 'года', 'около', 'после'
-    }
-    
-    filtered = {w for w in words if w not in stop_words and len(w) > 3}
-    return filtered
-
-
-def is_duplicate_post(raw_text):
-    """Проверяет, публиковался ли похожий текст или новость на ту же тему за последние часы."""
+def _cleanup_old_history():
     global SENT_POSTS_HISTORY
     current_time = time.time()
-    
-    # Очищаем устаревшую историю
-    SENT_POSTS_HISTORY = [item for item in SENT_POSTS_HISTORY if current_time - item['timestamp'] < DUPLICATE_TIME_WINDOW]
-    
-    norm_new = normalize_text(raw_text)
-    keywords_new = extract_keywords(raw_text)
-    
-    if not norm_new or len(norm_new.split()) < 4:
-        return False  # Слишком короткий текст для надежного сравнения
+    SENT_POSTS_HISTORY = [
+        item for item in SENT_POSTS_HISTORY
+        if current_time - item['timestamp'] < DUPLICATE_TIME_WINDOW
+    ]
+
+
+def is_duplicate_post(text_for_check: str) -> bool:
+    _cleanup_old_history()
+    norm_new = normalize_text(text_for_check)
+
+    if not norm_new or len(norm_new.split()) < 6:
+        return False
 
     for item in SENT_POSTS_HISTORY:
         norm_existing = item['normalized_text']
-        keywords_existing = item.get('keywords', set())
-        
-        # 1. Проверка по совпадению ключевых слов (новостной теме)
-        if keywords_new and keywords_existing:
-            common_keywords = keywords_new.intersection(keywords_existing)
-            if len(common_keywords) >= 3:
-                print(f"[АНТИДУБЛЬ] Найдена та же новость по ключевым словам ({common_keywords}). Пропускаем.")
-                return True
-
-        # 2. Считаем коэффициент схожести текстов (SequenceMatcher)
         similarity = difflib.SequenceMatcher(None, norm_new, norm_existing).ratio()
-        
         if similarity >= SIMILARITY_THRESHOLD:
             print(f"[АНТИДУБЛЬ] Найден похожий пост (схожесть {int(similarity * 100)}%). Пропускаем.")
             return True
-            
-    # Если дубликат не найден, добавляем текущий в историю
-    SENT_POSTS_HISTORY.append({
-        'normalized_text': norm_new,
-        'keywords': keywords_new,
-        'timestamp': current_time
-    })
+
     return False
 
 
-def is_ad_or_pr(text):
+def record_published_post(text_for_check: str):
+    _cleanup_old_history()
+    norm_new = normalize_text(text_for_check)
+    if norm_new and len(norm_new.split()) >= 6:
+        SENT_POSTS_HISTORY.append({
+            'normalized_text': norm_new,
+            'timestamp': time.time()
+        })
+
+
+def is_ad_or_pr(text: str) -> bool:
     if not text:
         return False
     text_lower = text.lower()
@@ -146,107 +137,106 @@ def is_ad_or_pr(text):
     return False
 
 
-def clean_text_and_entities(text, entities):
+def _shift_py_index(idx: int, removed_spans: list) -> int:
+    shifted = idx
+    for start, end in removed_spans:
+        if idx >= end:
+            shifted -= (end - start)
+        elif idx > start:
+            shifted = start
+    return max(0, shifted)
+
+
+def clean_text_and_entities(text: str, entities):
     if not text:
         return "", None
 
-    from telethon.tl import types
+    original_text = text
+    remove_spans = []
+
+    if entities:
+        for e in entities:
+            if isinstance(e, (types.MessageEntityTextUrl, types.MessageEntityUrl)):
+                py_start = _utf16_to_py_index(original_text, e.offset)
+                py_end = _utf16_to_py_index(original_text, e.offset + e.length)
+                url = getattr(e, 'url', '') or ''
+                anchor_text = original_text[py_start:py_end]
+                check_target = f"{url} {anchor_text}".lower()
+                if any(k in check_target for k in ('t.me/', 'telegram.me/', 'tg://')):
+                    remove_spans.append((py_start, py_end))
+
+    merged_spans = []
+    if remove_spans:
+        remove_spans.sort()
+        for start, end in remove_spans:
+            if not merged_spans or start > merged_spans[-1][1]:
+                merged_spans.append([start, end])
+            else:
+                merged_spans[-1][1] = max(merged_spans[-1][1], end)
+
+        for start, end in reversed(merged_spans):
+            text = text[:start] + text[end:]
 
     safe_entities = []
     if entities:
         for e in entities:
             if isinstance(e, types.MessageEntityCustomEmoji):
                 continue
-
             if isinstance(e, (types.MessageEntityTextUrl, types.MessageEntityUrl)):
-                url = getattr(e, 'url', '')
-                if 't.me' in url or 'telegram.me' in url or 'tg://' in url:
-                    start = e.offset
-                    length = e.length
-                    text = text[:start] + "" + text[start + length:]
-                    
-                    diff = -length
-                    for other in entities:
-                        if other.offset > start:
-                            other.offset += diff
+                url = getattr(e, 'url', '') or ''
+                if any(k in url.lower() for k in ('t.me/', 'telegram.me/', 'tg://')):
                     continue
 
-            safe_entities.append(e)
+            py_start = _utf16_to_py_index(original_text, e.offset)
+            py_end = _utf16_to_py_index(original_text, e.offset + e.length)
+
+            new_py_start = _shift_py_index(py_start, merged_spans)
+            new_py_end = _shift_py_index(py_end, merged_spans)
+
+            if new_py_end <= new_py_start:
+                continue
+
+            new_offset = _py_to_utf16_index(text, new_py_start)
+            new_length = _py_to_utf16_index(text, new_py_end) - new_offset
+            if new_length <= 0:
+                continue
+
+            e_copy = type(e)(offset=new_offset, length=new_length)
+            for attr in ('url', 'user_id', 'language', 'document_id', 'collapsed'):
+                if hasattr(e, attr) and hasattr(e_copy, attr):
+                    setattr(e_copy, attr, getattr(e, attr))
+            safe_entities.append(e_copy)
 
     text = text.replace('🥺', '')
-    text = re.sub(r'https?://t\.me/\w+/?', '', text)
-    text = re.sub(r't\.me/\w+/?', '', text)
+    text = re.sub(r'https?://(?:t|telegram)\.me/\S+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<!\w)(?:t|telegram)\.me/\S+', '', text, flags=re.IGNORECASE)
     text = re.sub(r'@\w+', '', text)
 
-    orphan_phrases = [
-        r'скачать можно\s*[\.,!]?(?=\s*$)',
-        r'взять можно\s*[\.,!]?(?=\s*$)',
-        r'найти можно\s*[\.,!]?(?=\s*$)',
-        r'перейти можно\s*[\.,!]?(?=\s*$)',
-        r'ссылка:\s*$',
-        r'источник:\s*$',
-        r'наш канал:\s*$'
+    tail_patterns = [
+        r'(?im)^[ \t]*(?:👉|➡️|▶️|🔹|🔸|📌|🔗|👇)?[ \t]*(?:источник|канал|подписаться|наш канал)\s*:?.*$',
+        r'(?im)^[ \t]*👉[ \t]+\S+(?:\s+\S+)?[ \t]*$',
+        r'(?is)(?:\n\s*){1,2}(?:скачать|взять|найти|перейти)\s+можно\s*[\.,!]?\s*$'
     ]
-    for pattern in orphan_phrases:
-        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    for pattern in tail_patterns:
+        text = re.sub(pattern, '', text)
+
+    lines = text.splitlines()
+    while lines and re.fullmatch(r'[\s\W_]*', lines[-1], flags=re.UNICODE):
+        lines.pop()
+    text = '\n'.join(lines)
 
     text = re.sub(r'\n{3,}', '\n\n', text).strip()
+
+    if text != original_text:
+        safe_entities = None
+
     return text, safe_entities if safe_entities else None
 
 
-# Инициализируем клиент через StringSession для облачного хостинга на Render
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-albums_cache = {}
-
-@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
-async def handle_new_post(event):
-    message = event.message
-    text = message.raw_text or ""
-
-    if is_ad_or_pr(text):
-        print(f"[ПРОПУСК] Реклама, пиар, розыгрыш или подборки обоев в канале {event.chat_id}")
-        return
-
-    safe_entities = list(message.entities) if message.entities else None
-
-    # Обработка альбомов (медиа-групп)
-    if message.grouped_id:
-        group_id = message.grouped_id
-        if group_id not in albums_cache:
-            albums_cache[group_id] = {
-                'messages': [],
-                'text': "",
-                'entities': None,
-                'chat': event.chat_id
-            }
-        
-        albums_cache[group_id]['messages'].append(message)
-        
-        if text and not albums_cache[group_id]['text']:
-            albums_cache[group_id]['text'] = text
-            albums_cache[group_id]['entities'] = safe_entities
-
-        await asyncio.sleep(1.5)
-        
-        if group_id in albums_cache:
-            data = albums_cache.pop(group_id)
-            msgs = data['messages']
-            raw_txt = data['text']
-            ent = data['entities']
-            
-            # Проверяем альбом на дубликаты по тексту и ключевым словам
-            if raw_txt and is_duplicate_post(raw_txt):
-                return
-            
-            print(f"[АЛЬБОМ] Публикуем альбом из {data['chat']}...")
-            cleaned_text, final_entities = clean_text_and_entities(raw_txt, ent)
-            media_list = [m.media for m in msgs if m.media]
-            
-            if not cleaned_text and not media_list:
-                print("[ПРОПУСК] Альбом пуст после очистки.")
-                return
-            
-            try:
+async def publish_content(media_list, cleaned_text: str, final_entities, is_album: bool):
+    while True:
+        try:
+            if is_album:
                 if media_list:
                     await client.send_file(
                         TARGET_CHANNEL,
@@ -256,71 +246,155 @@ async def handle_new_post(event):
                     )
                 else:
                     await client.send_message(
-                        TARGET_CHANNEL, 
-                        cleaned_text, 
+                        TARGET_CHANNEL,
+                        cleaned_text,
                         formatting_entities=final_entities
                     )
+            else:
+                if media_list:
+                    await client.send_file(
+                        TARGET_CHANNEL,
+                        file=media_list[0],
+                        caption=cleaned_text if cleaned_text else None,
+                        formatting_entities=final_entities
+                    )
+                else:
+                    await client.send_message(
+                        TARGET_CHANNEL,
+                        cleaned_text,
+                        formatting_entities=final_entities
+                    )
+            return True
+        except FloodWaitError as e:
+            print(f"[FLOOD_WAIT] Ожидание {e.seconds} сек...")
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            print(f"[ОШИБКА] Не удалось опубликовать: {e}")
+            return False
+
+
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+albums_cache = {}
+
+
+@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
+async def handle_new_post(event):
+    message = event.message
+    text = message.raw_text or ""
+
+    if is_ad_or_pr(text):
+        print(f"[ПРОПУСК] Реклама/спам/фильтр в канале {event.chat_id}")
+        return
+
+    safe_entities = list(message.entities) if message.entities else None
+
+    if message.grouped_id:
+        group_id = message.grouped_id
+        if group_id not in albums_cache:
+            albums_cache[group_id] = {
+                'messages': [],
+                'text': "",
+                'entities': None,
+                'chat': event.chat_id
+            }
+
+        albums_cache[group_id]['messages'].append(message)
+
+        if text and not albums_cache[group_id]['text']:
+            albums_cache[group_id]['text'] = text
+            albums_cache[group_id]['entities'] = safe_entities
+
+        await asyncio.sleep(1.5)
+
+        if group_id in albums_cache:
+            data = albums_cache.pop(group_id)
+            msgs = data['messages']
+            raw_txt = data['text']
+            ent = data['entities']
+
+            cleaned_text, final_entities = clean_text_and_entities(raw_txt, ent)
+            if cleaned_text and is_duplicate_post(cleaned_text):
+                return
+
+            media_list = [m.media for m in msgs if m.media]
+            if not cleaned_text and not media_list:
+                print("[ПРОПУСК] Альбом пуст после очистки.")
+                return
+
+            print(f"[АЛЬБОМ] Публикуем альбом из {data['chat']}...")
+            ok = await publish_content(media_list, cleaned_text, final_entities, is_album=True)
+            if ok:
+                if cleaned_text:
+                    record_published_post(cleaned_text)
                 print("[УСПЕХ] Альбом опубликован!")
-            except Exception as e:
-                print(f"[ОШИБКА] Не удалось отправить альбом: {e}")
         return
 
-    # Одиночные посты
-    if text and is_duplicate_post(text):
-        return
-
-    print(f"[НОВЫЙ ПОСТ] Обрабатываем пост из {event.chat_id}...")
     cleaned_text, final_entities = clean_text_and_entities(text, safe_entities)
+    if cleaned_text and is_duplicate_post(cleaned_text):
+        return
 
-    if not cleaned_text and not message.media:
+    media_list = [message.media] if message.media else []
+    if not cleaned_text and not media_list:
         print("[ПРОПУСК] Сообщение пустое.")
         return
 
-    try:
-        if message.media:
-            await client.send_file(
-                TARGET_CHANNEL,
-                file=message.media,
-                caption=cleaned_text if cleaned_text else None,
-                formatting_entities=final_entities
-            )
-        else:
-            await client.send_message(
-                TARGET_CHANNEL, 
-                cleaned_text, 
-                formatting_entities=final_entities
-            )
+    print(f"[НОВЫЙ ПОСТ] Обрабатываем пост из {event.chat_id}...")
+    ok = await publish_content(media_list, cleaned_text, final_entities, is_album=False)
+    if ok:
+        if cleaned_text:
+            record_published_post(cleaned_text)
         print("[УСПЕХ] Пост опубликован в @joybyte!")
-    except Exception as e:
-        print(f"[ОШИБКА] Не удалось опубликовать: {e}")
 
-# --- Веб-сервер для Render ---
+
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
+
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    
+
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"Веб-сервер для Render запущен на порту {port}")
 
+
+async def preload_channels():
+    """Выводит каналы из диалогов аккаунта (с их ID) и проверяет источники."""
+    dialogs = await client.get_dialogs()
+    print("--- КАНАЛЫ В ДИАЛОГАХ АККАУНТА (ID | НАЗВАНИЕ | @USERNAME) ---")
+    for d in dialogs:
+        if d.is_channel:
+            peer_id = get_peer_id(d.entity)
+            title = getattr(d.entity, 'title', 'Без названия')
+            username = getattr(d.entity, 'username', None)
+            u_str = f"@{username}" if username else "приватный"
+            print(f"  ID: {peer_id} | {title} | {u_str}")
+    print("-------------------------------------------------------------")
+
+    for ch in SOURCE_CHANNELS:
+        try:
+            entity = await client.get_entity(ch)
+            print(f"[КАНАЛ ОК] {ch} -> {getattr(entity, 'title', ch)}")
+        except Exception as e:
+            print(f"[КАНАЛ ОШИБКА] Нет доступа к {ch}: {e}")
+
+
 async def main():
     print("Инициализация подключения к Telegram...")
     await client.connect()
-    
+
     if not await client.is_user_authorized():
         print("Ошибка: сессия не авторизована.")
         return
-        
+
+    await preload_channels()
     await start_web_server()
-        
-    print("Бот запущен и отслеживает посты (с улучшенной защитой от дубликатов)...")
-        
+    print("Бот запущен и отслеживает посты...")
+
     while True:
         try:
             await client.run_until_disconnected()
@@ -329,8 +403,9 @@ async def main():
             await asyncio.sleep(5)
             try:
                 await client.connect()
-            except:
+            except Exception:
                 pass
+
 
 if __name__ == '__main__':
     try:
