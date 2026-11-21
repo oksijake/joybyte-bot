@@ -196,12 +196,32 @@ def _clone_entity(e, new_offset: int, new_length: int):
         return None
 
 
+def _apply_removals(text: str, py_spans: list):
+    """Удаляет списки интервалов [start, end) в индексах Python и возвращает (новый_текст, объединённые_интервалы)."""
+    if not py_spans:
+        return text, []
+
+    merged = []
+    for start, end in sorted(py_spans):
+        if end <= start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    for start, end in reversed(merged):
+        text = text[:start] + text[end:]
+
+    return text, merged
+
+
 def clean_text_and_entities(text: str, entities):
     if not text:
         return "", None
 
     original_text = text
-    remove_spans = []
+    tg_spans = []
 
     if entities:
         for e in entities:
@@ -212,22 +232,53 @@ def clean_text_and_entities(text: str, entities):
                 anchor_text = original_text[py_start:py_end]
                 check_target = f"{url} {anchor_text}".lower()
                 if any(k in check_target for k in ('t.me/', 'telegram.me/', 'tg://')):
-                    remove_spans.append((py_start, py_end))
+                    tg_spans.append((py_start, py_end))
 
-    merged_spans = []
-    if remove_spans:
-        remove_spans.sort()
-        for start, end in remove_spans:
-            if not merged_spans or start > merged_spans[-1][1]:
-                merged_spans.append([start, end])
-            else:
-                merged_spans[-1][1] = max(merged_spans[-1][1], end)
+    text, merged_tg_spans = _apply_removals(text, tg_spans)
 
-        for start, end in reversed(merged_spans):
-            text = text[:start] + text[end:]
+    # Собираем regex-удаления на текущем тексте и переносим их индексы в координаты original_text
+    extra_spans_in_current = []
 
+    for m in re.finditer('🥺', text):
+        extra_spans_in_current.append((m.start(), m.end()))
+
+    for pattern in (
+        r'https?://(?:t|telegram)\.me/\S+',
+        r'(?<!\w)(?:t|telegram)\.me/\S+',
+        r'@\w+',
+        r'(?im)^[ \t]*(?:👉|➡️|▶️|🔹|🔸|📌|🔗|👇)?[ \t]*(?:источник|канал|подписаться|наш канал)\s*:?.*$',
+        r'(?im)^[ \t]*👉[ \t]+\S+(?:\s+\S+)?[ \t]*$',
+        r'(?is)(?:\n\s*){1,2}(?:скачать|взять|найти|перейти)\s+можно\s*[\.,!]?\s*$',
+    ):
+        for m in re.finditer(pattern, text, flags=re.IGNORECASE if '(?i' not in pattern else 0):
+            extra_spans_in_current.append((m.start(), m.end()))
+
+    text, merged_extra_spans = _apply_removals(text, extra_spans_in_current)
+
+    # Срезаем пустые/небуквенные хвостовые строки в конце
+    lines = text.splitlines(keepends=True)
+    while lines and re.fullmatch(r'[\s\W_]*\r?\n?', lines[-1], flags=re.UNICODE):
+        removed_line = lines.pop()
+        line_start = sum(len(x) for x in lines)
+        merged_extra_spans.append([line_start, line_start + len(removed_line)])
+
+    text = ''.join(lines)
+
+    # Убираем тройные и более переносы строк в конце/середине
+    collapsed_spans = []
+    for m in re.finditer(r'\n{3,}', text):
+        collapsed_spans.append((m.start() + 2, m.end()))
+    text, merged_collapse_spans = _apply_removals(text, collapsed_spans)
+
+    # Убираем ведущие/замыкающие пробелы и переносы строк
+    leading_len = len(text) - len(text.lstrip())
+    trailing_start = len(text.rstrip())
+    trailing_len = len(text) - trailing_start
+    text = text.strip()
+
+    # Пересчёт сущностей с учётом всех удалений (в координатах итогового text)
     safe_entities = []
-    if entities:
+    if entities and text:
         for e in entities:
             if isinstance(e, types.MessageEntityCustomEmoji):
                 continue
@@ -239,43 +290,39 @@ def clean_text_and_entities(text: str, entities):
             py_start = _utf16_to_py_index(original_text, e.offset)
             py_end = _utf16_to_py_index(original_text, e.offset + e.length)
 
-            new_py_start = _shift_py_index(py_start, merged_spans)
-            new_py_end = _shift_py_index(py_end, merged_spans)
-
-            if new_py_end <= new_py_start:
+            # Пропускаем сущность, если она полностью внутри удалённой TG-ссылки
+            if any(s <= py_start and py_end <= end for s, end in merged_tg_spans):
                 continue
 
-            new_offset = _py_to_utf16_index(text, new_py_start)
-            new_length = _py_to_utf16_index(text, new_py_end) - new_offset
+            cur_start = _shift_py_index(py_start, merged_tg_spans)
+            cur_end = _shift_py_index(py_end, merged_tg_spans)
+
+            if any(s <= cur_start and cur_end <= end for s, end in merged_extra_spans):
+                continue
+
+            cur_start = _shift_py_index(cur_start, merged_extra_spans)
+            cur_end = _shift_py_index(cur_end, merged_extra_spans)
+
+            cur_start = _shift_py_index(cur_start, merged_collapse_spans)
+            cur_end = _shift_py_index(cur_end, merged_collapse_spans)
+
+            cur_start = max(0, cur_start - leading_len)
+            cur_end = max(0, cur_end - leading_len)
+
+            if cur_end > trailing_start - leading_len:
+                cur_end = trailing_start - leading_len
+
+            if cur_end <= cur_start:
+                continue
+
+            new_offset = _py_to_utf16_index(text, cur_start)
+            new_length = _py_to_utf16_index(text, cur_end) - new_offset
             if new_length <= 0:
                 continue
 
             e_copy = _clone_entity(e, new_offset, new_length)
             if e_copy is not None:
                 safe_entities.append(e_copy)
-
-    text = text.replace('🥺', '')
-    text = re.sub(r'https?://(?:t|telegram)\.me/\S+', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'(?<!\w)(?:t|telegram)\.me/\S+', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'@\w+', '', text)
-
-    tail_patterns = [
-        r'(?im)^[ \t]*(?:👉|➡️|▶️|🔹|🔸|📌|🔗|👇)?[ \t]*(?:источник|канал|подписаться|наш канал)\s*:?.*$',
-        r'(?im)^[ \t]*👉[ \t]+\S+(?:\s+\S+)?[ \t]*$',
-        r'(?is)(?:\n\s*){1,2}(?:скачать|взять|найти|перейти)\s+можно\s*[\.,!]?\s*$'
-    ]
-    for pattern in tail_patterns:
-        text = re.sub(pattern, '', text)
-
-    lines = text.splitlines()
-    while lines and re.fullmatch(r'[\s\W_]*', lines[-1], flags=re.UNICODE):
-        lines.pop()
-    text = '\n'.join(lines)
-
-    text = re.sub(r'\n{3,}', '\n\n', text).strip()
-
-    if text != original_text:
-        safe_entities = None
 
     return text, safe_entities if safe_entities else None
 
