@@ -15,7 +15,7 @@ API_HASH = '99073f3ecb25cbf13adf9391ae4190c3'
 SESSION_STRING = os.getenv('SESSION_STRING')
 
 SOURCE_CHANNELS = [
-    'pekagame',
+    '1418440636',
     'oneshot_tg',
     'igromania',
     'oksikek',
